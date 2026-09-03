@@ -1,0 +1,42 @@
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.Python
+build/
+dist/
+.venv/
+.venv*/
+venv/
+env/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# Local secrets / exported certs (never commit private keys)
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+certificate/*
+
+# Protoshield
+.protoshield/
+.holmes/

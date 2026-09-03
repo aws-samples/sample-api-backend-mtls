@@ -1,0 +1,1039 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Full stack for the API Gateway outbound mTLS demo (NLB + ECS Fargate
+  variant): a front-facing REST API presenting an ACM-issued client
+  certificate on its outbound TLS handshake (outbound mTLS), a private
+  CA, an internet-facing Network Load Balancer (TCP passthrough), and an
+  ECS Fargate task running an nginx sidecar (terminates inbound mTLS,
+  validates the client cert against the truststore) in front of a
+  Python 3.14 validator app. The two container images are built and
+  pushed to pre-existing ECR repositories via the AWS CLI/Docker before
+  deploying this template -- see README.md -- so the whole stack
+  deploys in a single `sam deploy` pass.
+
+Parameters:
+  BackendServerCommonName:
+    Type: String
+    Description: >
+      Common Name for the Fargate server certificate (issued by the
+      private CA -- does not need to be a real, resolvable domain since
+      there is no DNS validation for private-CA-issued certificates).
+    Default: backend.mtls-outbound-demo.internal
+
+  FrontClientCommonName:
+    Type: String
+    Description: >
+      Common Name for the client certificate to be presented by the
+      front API's stage for outbound mTLS.
+    Default: front-client.mtls-outbound-demo.internal
+
+  ImageTag:
+    Type: String
+    Description: Tag to use for both the nginx and validator app images.
+    Default: latest
+
+  NginxRepositoryUri:
+    Type: String
+    Description: >
+      Full ECR repository URI (no tag) for the nginx sidecar image,
+      e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-nginx-repo.
+      The repository must already exist and already contain an image
+      tagged ImageTag -- build and push it with the AWS CLI/Docker
+      before running `sam deploy` (see README.md). CloudFormation
+      cannot build or push container images itself, so unlike the VPC,
+      NLB, and private CA below, this repository is not created by this
+      template.
+
+  ValidatorRepositoryUri:
+    Type: String
+    Description: >
+      Full ECR repository URI (no tag) for the validator app image,
+      e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-validator-repo.
+      Same requirements as NginxRepositoryUri above.
+
+  CertExportVersion:
+    Type: String
+    Description: >
+      Bump this value (via --parameter-overrides on a normal `sam deploy`)
+      whenever the cert_export_custom_resource logic changes and the
+      already-issued certificate needs to be re-exported into Secrets
+      Manager. Changing it forces CloudFormation to send an Update
+      request to the CertExportCustomResource (custom resources are only
+      re-invoked when one of their properties changes) and forces a new
+      ECS TaskDefinition revision (via the CERT_EXPORT_VERSION env var
+      below), so the running Fargate task is replaced and picks up the
+      corrected secret value. Default bumped to "3" to pick up:
+        v2 - nginx sidecar being served the leaf certificate only,
+             instead of the leaf + full CA chain nginx's
+             `ssl_certificate` directive requires.
+        v3 - FargateServerCert missing a SubjectAlternativeName for the
+             NLB's DNS name, causing API Gateway's insecureSkipVerification
+             hostname check to fail the outbound mTLS handshake.
+    Default: '3'
+
+  ApiStageName:
+    Type: String
+    Description: Stage name for the front-facing REST API.
+    Default: dev
+
+  EnableOutboundMtls:
+    Type: String
+    Description: >
+      Set to "false" to temporarily omit ClientCertificateId from the
+      front API's stage, for negative-testing that outbound mTLS is
+      actually enforced end to end (a call through the front API that
+      presents no client certificate should fail against nginx's
+      ssl_verify_client, typically surfacing as a 502 from API Gateway
+      since the integration's TLS handshake to the backend fails).
+      Leave "true" for normal operation. Redeploy with "true" afterward
+      to restore outbound mTLS.
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  OutboundMtlsDisabled: !Equals [!Ref EnableOutboundMtls, 'false']
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 256
+    Runtime: python3.14
+    Handler: app.lambda_handler
+
+Resources:
+  # =======================================================================
+  # Networking: new VPC with public subnets (for the internet-facing NLB,
+  # since the front API reaches this backend over the public internet)
+  # and private subnets (for the Fargate tasks). A single NAT Gateway is
+  # used to keep cost down; this is not a highly-available NAT setup,
+  # which is an acceptable trade-off for a demo.
+  # =======================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      # Only the NAT Gateway (and the internet-facing NLB's ENIs, which
+      # AWS manages directly) sit in these subnets. The NAT Gateway gets
+      # its public IP via the explicit NatEip association below, not via
+      # subnet auto-assignment, so this can safely stay off.
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-2"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-2"
+
+  # VPC Flow Logs -- captures accepted/rejected traffic metadata for the
+  # VPC to a dedicated CloudWatch Logs log group.
+  VpcFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/vpc/${AWS::StackName}-flow-logs"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt MtlsDemoKey.Arn
+
+  VpcFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: VpcFlowLogDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt VpcFlowLogGroup.Arn
+
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref Vpc
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VpcFlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt VpcFlowLogRole.Arn
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-rt"
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  NlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound HTTPS (TLS/mTLS passthrough) to the NLB.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: >-
+            Allow inbound HTTPS from any internet client -- required since
+            this NLB is internet-facing and is the entry point for the
+            front API outbound mTLS calls.
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: >-
+            NLB passthrough traffic to backend targets; the NLB itself
+            does not terminate TLS so its egress cannot be restricted to
+            a single port or protocol.
+
+  FargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound HTTPS from the NLB only; allow all outbound (ECR pull, logs).
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref NlbSecurityGroup
+          Description: Allow inbound HTTPS (mTLS) only from the NLB.
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: >-
+            Allow all outbound for ECR image pulls and CloudWatch Logs
+            delivery (both reached via public endpoints through the NAT
+            Gateway from these private subnets).
+
+  # =======================================================================
+  # Private CA hierarchy
+  #
+  # Root CA -> Subordinate (mTLS) CA. The subordinate CA issues:
+  #   1. FargateServerCert -- the nginx sidecar's TLS server identity.
+  #      Issued by the private CA (not a public ACM cert) specifically
+  #      because ACM only allows exporting the private key for
+  #      private-CA-issued certificates -- required to load the key into
+  #      the Fargate container.
+  #   2. FrontClientCert -- presented by the front API's stage on the
+  #      outbound mTLS handshake.
+  # The CA bundle (root + subordinate CA certs) is stored as the
+  # truststore nginx uses to validate the front API's client certificate.
+  # =======================================================================
+  RootCA:
+    Type: AWS::ACMPCA::CertificateAuthority
+    Properties:
+      KeyAlgorithm: RSA_2048
+      SigningAlgorithm: SHA256WITHRSA
+      Subject:
+        CommonName: !Sub "${AWS::StackName}-rootca"
+      Type: ROOT
+
+  RootCACertificate:
+    Type: AWS::ACMPCA::Certificate
+    Properties:
+      CertificateAuthorityArn: !Ref RootCA
+      CertificateSigningRequest: !GetAtt RootCA.CertificateSigningRequest
+      SigningAlgorithm: SHA256WITHRSA
+      TemplateArn: 'arn:aws:acm-pca:::template/RootCACertificate/V1'
+      Validity:
+        Type: YEARS
+        Value: 10
+
+  RootCAActivation:
+    Type: AWS::ACMPCA::CertificateAuthorityActivation
+    Properties:
+      Certificate: !GetAtt RootCACertificate.Certificate
+      CertificateAuthorityArn: !Ref RootCA
+      Status: ACTIVE
+
+  MtlsCA:
+    Type: AWS::ACMPCA::CertificateAuthority
+    Properties:
+      Type: SUBORDINATE
+      KeyAlgorithm: RSA_2048
+      SigningAlgorithm: SHA256WITHRSA
+      Subject:
+        CommonName: !Sub "${AWS::StackName}-mtlsca"
+
+  MtlsCACertificate:
+    DependsOn: RootCAActivation
+    Type: AWS::ACMPCA::Certificate
+    Properties:
+      CertificateAuthorityArn: !Ref RootCA
+      CertificateSigningRequest: !GetAtt MtlsCA.CertificateSigningRequest
+      SigningAlgorithm: SHA256WITHRSA
+      TemplateArn: 'arn:aws:acm-pca:::template/SubordinateCACertificate_PathLen0/V1'
+      Validity:
+        Type: YEARS
+        Value: 3
+
+  MtlsCAActivation:
+    Type: AWS::ACMPCA::CertificateAuthorityActivation
+    Properties:
+      CertificateAuthorityArn: !Ref MtlsCA
+      Certificate: !GetAtt MtlsCACertificate.Certificate
+      CertificateChain: !GetAtt RootCAActivation.CompleteCertificateChain
+      Status: ACTIVE
+
+  FargateServerCert:
+    DependsOn: MtlsCAActivation
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      CertificateAuthorityArn: !Ref MtlsCA
+      CertificateTransparencyLoggingPreference: ENABLED
+      DomainName: !Ref BackendServerCommonName
+      # API Gateway's insecureSkipVerification still checks the
+      # integration endpoint's hostname against the server certificate
+      # (see the tlsConfig docs), and the integration URI is the NLB's
+      # DNS name -- not BackendServerCommonName. Without this SAN, the
+      # front API's outbound mTLS call fails hostname verification and
+      # the integration returns a generic 500. Private-CA-issued certs
+      # aren't DNS-validated, so adding the NLB's real DNS name here
+      # doesn't require it to be resolvable/owned beyond what it already
+      # is.
+      SubjectAlternativeNames:
+        - !GetAtt Nlb.DNSName
+      Tags:
+        - Key: Name
+          Value: FargateServerCert
+
+  FrontClientCert:
+    DependsOn: MtlsCAActivation
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      CertificateAuthorityArn: !Ref MtlsCA
+      CertificateTransparencyLoggingPreference: ENABLED
+      DomainName: !Ref FrontClientCommonName
+      Tags:
+        - Key: Name
+          Value: FrontClientCert
+
+  # =======================================================================
+  # Customer-managed KMS key -- used to encrypt the Secrets Manager
+  # secrets below and the ECS task log group, instead of relying on the
+  # AWS-managed keys for each service. (The two ECR repositories are
+  # created and pushed to before this stack deploys -- see
+  # NginxRepositoryUri/ValidatorRepositoryUri above -- so this key does
+  # not need an ECR grant; encrypt those repositories however you
+  # provision them.)
+  # =======================================================================
+  MtlsDemoKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "CMK for ${AWS::StackName}: Secrets Manager and CloudWatch Logs encryption."
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccountFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowSecretsManagerUse
+            Effect: Allow
+            Principal:
+              Service: secretsmanager.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "kms:ViaService": !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+                "kms:CallerAccount": !Ref AWS::AccountId
+          - Sid: AllowCloudWatchLogsUse
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              ArnLike:
+                "kms:EncryptionContext:aws:logs:arn": !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+  MtlsDemoKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-mtls-demo"
+      TargetKeyId: !Ref MtlsDemoKey
+
+  # =======================================================================
+  # Secrets Manager: holds the Fargate server certificate, its decrypted
+  # private key, and the CA bundle (truststore). Populated by the
+  # CertExportCustomResource after certificate issuance. The ECS task
+  # execution role injects these into the nginx container as environment
+  # variables via the task definition's `secrets` property.
+  # =======================================================================
+  # checkov:skip=CKV_SECRET_6: SecretString below is a literal placeholder
+  # string, not a real secret value -- overwritten by
+  # CertExportCustomResource once the certificate is issued.
+  ServerCertSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub "${AWS::StackName}/server-cert"
+      Description: PEM certificate for the Fargate/nginx TLS server identity.
+      SecretString: placeholder-populated-by-custom-resource
+      KmsKeyId: !Ref MtlsDemoKey
+
+  ServerKeySecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub "${AWS::StackName}/server-key"
+      Description: Decrypted PEM private key for the Fargate/nginx TLS server identity.
+      SecretString: placeholder-populated-by-custom-resource
+      KmsKeyId: !Ref MtlsDemoKey
+
+  CaBundleSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub "${AWS::StackName}/ca-bundle"
+      Description: PEM CA bundle (root + subordinate) used as the mTLS truststore by nginx.
+      SecretString: placeholder-populated-by-custom-resource
+      KmsKeyId: !Ref MtlsDemoKey
+
+  CertExportFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CertExportPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: acm:ExportCertificate
+                Resource: !Ref FargateServerCert
+              - Effect: Allow
+                Action: secretsmanager:PutSecretValue
+                Resource:
+                  - !Ref ServerCertSecret
+                  - !Ref ServerKeySecret
+                  - !Ref CaBundleSecret
+              - Effect: Allow
+                # Secrets Manager calls KMS using the caller's (this
+                # role's) credentials when the secret uses a customer
+                # managed key, so PutSecretValue also needs this.
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource: !GetAtt MtlsDemoKey.Arn
+              - Effect: Allow
+                # Scoped to this function's own log group only. The log
+                # group name is deterministic because the function sets an
+                # explicit FunctionName (see CertExportCustomResourceFunction),
+                # so CloudWatch Logs creates /aws/lambda/<FunctionName>.
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-cert-export"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-cert-export:log-stream:*"
+              - Effect: Allow
+                # Lambda delivers failed invocation records to the DLQ
+                # using this function's own execution role; the queue is
+                # KMS-encrypted with the same CMK the role already has
+                # kms:GenerateDataKey/Decrypt on above.
+                Action: sqs:SendMessage
+                Resource: !GetAtt CertExportDlq.Arn
+
+  CertExportDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-cert-export-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days
+      KmsMasterKeyId: !Ref MtlsDemoKey
+
+  CertExportCustomResourceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      # Explicit name so the CloudWatch Logs log group (/aws/lambda/<name>)
+      # is deterministic and the execution role's logs permissions can be
+      # scoped to that specific log group.
+      FunctionName: !Sub "${AWS::StackName}-cert-export"
+      Description: Exports the Fargate server cert from ACM and stores cert/key/CA-bundle in Secrets Manager.
+      CodeUri: cert_export_custom_resource/
+      Role: !GetAtt CertExportFunctionRole.Arn
+      # Custom resource Lambdas are invoked at most a handful of times per
+      # stack operation, so a small reserved concurrency limit is safe and
+      # avoids consuming unreserved account-level concurrency.
+      ReservedConcurrentExecutions: 2
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt CertExportDlq.Arn
+
+  CertExportCustomResource:
+    Type: Custom::CertExport
+    DependsOn: MtlsCAActivation
+    Properties:
+      ServiceToken: !GetAtt CertExportCustomResourceFunction.Arn
+      CertificateArn: !Ref FargateServerCert
+      ServerCertSecretId: !Ref ServerCertSecret
+      ServerKeySecretId: !Ref ServerKeySecret
+      CaBundleSecretId: !Ref CaBundleSecret
+      CaBundlePem: !Join
+        - "\n"
+        - - !GetAtt MtlsCACertificate.Certificate
+          - !GetAtt RootCACertificate.Certificate
+      # Not used by the Lambda; changing this forces CloudFormation to
+      # send an Update request so the custom resource re-runs (custom
+      # resources only re-invoke on property changes).
+      ExportVersion: !Ref CertExportVersion
+
+  # =======================================================================
+  # ECS Fargate: cluster, task definition (nginx sidecar + validator app),
+  # and the service.
+  # =======================================================================
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enhanced
+
+  TaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-mtls-backend"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt MtlsDemoKey.Arn
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadMtlsSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref ServerCertSecret
+                  - !Ref ServerKeySecret
+                  - !Ref CaBundleSecret
+              # The secrets above are encrypted with the customer-managed
+              # MtlsDemoKey (not the AWS-managed aws/secretsmanager key), so
+              # the task execution role also needs its own kms:Decrypt
+              # grant -- Secrets Manager's ViaService permission on the key
+              # policy only lets the *service* use the key, it does not
+              # extend to the IAM principal calling GetSecretValue. Without
+              # this, ECS fails to start tasks with "AccessDeniedException:
+              # Access to KMS is not allowed" when pulling the secrets.
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt MtlsDemoKey.Arn
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-mtls-backend"
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: validator-app
+          Image: !Sub "${ValidatorRepositoryUri}:${ImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: validator-app
+
+        - Name: nginx-sidecar
+          Image: !Sub "${NginxRepositoryUri}:${ImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 443
+              Protocol: tcp
+          DependsOn:
+            - ContainerName: validator-app
+              Condition: START
+          Environment:
+            # Not read by the container; changing CertExportVersion
+            # forces a new TaskDefinition revision so the ECS Service
+            # replaces the running task and re-reads the (possibly
+            # updated) secrets below at container start.
+            - Name: CERT_EXPORT_VERSION
+              Value: !Ref CertExportVersion
+          Secrets:
+            - Name: SERVER_CERT_PEM
+              ValueFrom: !Ref ServerCertSecret
+            - Name: SERVER_KEY_PEM
+              ValueFrom: !Ref ServerKeySecret
+            - Name: CA_BUNDLE_PEM
+              ValueFrom: !Ref CaBundleSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: nginx-sidecar
+
+  # =======================================================================
+  # Network Load Balancer: internet-facing, plain TCP listener (Layer 4
+  # passthrough). NLB never sees the TLS handshake or any certificate --
+  # it just forwards raw bytes to the Fargate task, which terminates TLS
+  # itself (see nginx/ and the "TLS Termination happens within ECS
+  # Fargate container" note in the architecture diagram).
+  # =======================================================================
+  # S3 bucket for NLB access logs. Note: NLB access logs are only created
+  # for TLS listeners and only capture TLS request metadata (not the raw
+  # TCP passthrough itself, since the NLB never sees the TLS handshake
+  # for this listener type -- see the "TLS Termination happens within ECS
+  # Fargate container" comment on NlbListener). Must use SSE-S3, not
+  # SSE-KMS: NLB access log delivery does not support AWS managed KMS
+  # keys, and using a customer managed key would need extra key-policy
+  # grants for the ELB log delivery service beyond this demo's scope.
+  NlbAccessLogsBucket:
+    # checkov:skip=CKV_AWS_18: this bucket only stores NLB access logs;
+    # access-logging the log bucket itself is a recursive requirement not
+    # meaningful for a demo, and would need a second bucket.
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-nlb-logs-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 30
+          # Required once versioning is enabled, otherwise old/deleted
+          # log versions accumulate indefinitely and are never cleaned up.
+          - Id: ExpireOldLogVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  NlbAccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref NlbAccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSLogDeliveryAclCheck
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt NlbAccessLogsBucket.Arn
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+          - Sid: AWSLogDeliveryWrite
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${NlbAccessLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": bucket-owner-full-control
+                "aws:SourceAccount": !Ref AWS::AccountId
+
+  Nlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: NlbAccessLogsBucketPolicy
+    Properties:
+      Name: !Sub "${AWS::StackName}-nlb"
+      Type: network
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref NlbSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref NlbAccessLogsBucket
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-tg"
+      Protocol: TCP
+      Port: 443
+      TargetType: ip
+      VpcId: !Ref Vpc
+      HealthCheckProtocol: TCP
+      HealthCheckPort: traffic-port
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+
+  NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: 443
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - NlbListener
+      # Ensure the (possibly corrected) secrets are fully written before
+      # the service replaces running tasks with the new TaskDefinition
+      # revision -- otherwise a new task could start before the custom
+      # resource finishes updating Secrets Manager.
+      - CertExportCustomResource
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-service"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref FargateSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      LoadBalancers:
+        - ContainerName: nginx-sidecar
+          ContainerPort: 443
+          TargetGroupArn: !Ref TargetGroup
+
+  # =======================================================================
+  # Front-facing REST API: presents FrontClientCert on the outbound TLS
+  # handshake to the NLB (outbound mTLS -- the feature this sample
+  # demonstrates). API Gateway supports setting an ACM certificate ARN as
+  # the stage's ClientCertificateId to present on the outbound handshake.
+  #
+  # tlsConfig.insecureSkipVerification is only exposed through the
+  # x-amazon-apigateway-integration OpenAPI extension -- the native
+  # AWS::ApiGateway::Method Integration property type has no TlsConfig
+  # property -- so the API is defined via RestApi.Body (OpenAPI) rather
+  # than discrete Method/Integration resources.
+  # =======================================================================
+  FrontApi:
+    Type: AWS::ApiGateway::RestApi
+    DependsOn: NlbListener
+    Properties:
+      Name: !Sub "${AWS::StackName}-front-api"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Body:
+        swagger: '2.0'
+        info:
+          title: !Sub "${AWS::StackName}-front-api"
+          version: '1.0'
+        schemes:
+          - https
+        paths:
+          /validate:
+            get:
+              responses:
+                '200':
+                  description: OK
+                '400':
+                  description: >-
+                    Bad Request -- e.g. nginx rejected the connection
+                    because no client certificate was presented
+                    (outbound mTLS not configured or disabled).
+                '401':
+                  description: >-
+                    Unauthorized -- validator app rejected an expired
+                    or not-yet-valid client certificate.
+              x-amazon-apigateway-integration:
+                type: HTTP
+                httpMethod: GET
+                uri: !Sub "https://${Nlb.DNSName}/validate"
+                passthroughBehavior: WHEN_NO_MATCH
+                # NLB's server cert is issued by the private CA (not a
+                # publicly trusted one), so API Gateway can't validate it
+                # against a public trust store -- see FargateServerCert's
+                # comments in this template and the README for why the
+                # SAN on that certificate matters even with this flag on.
+                tlsConfig:
+                  insecureSkipVerification: true
+                # For HTTP-type integrations, each key below (other than
+                # "default") is a regex matched against the backend's
+                # actual status code, letting that real code pass through
+                # to the client instead of always returning 200. Without
+                # these, e.g. nginx's "400 No required SSL certificate was
+                # sent" (returned when outbound mTLS is disabled or
+                # misconfigured) would be silently flattened into an
+                # outer 200, hiding the failure from anything checking
+                # only the HTTP status code rather than the response body.
+                responses:
+                  '400':
+                    statusCode: '400'
+                  '401':
+                    statusCode: '401'
+                  default:
+                    statusCode: '200'
+
+  # An API Gateway deployment is an immutable snapshot of the RestApi
+  # taken when the deployment resource is created. CloudFormation does
+  # not track changes to FrontApi.Body, and it only re-creates a
+  # deployment when one of the deployment's own properties changes.
+  #
+  # If you edit FrontApi.Body (the OpenAPI definition above) and want the
+  # change to go live on an existing stack, change this resource's
+  # logical ID (e.g. append a version suffix, and update
+  # ApiStage.DeploymentId to match). That makes CloudFormation create a
+  # fresh deployment snapshot, repoint the stage at it, and delete the
+  # old one. (Changing only the Description does not work -- Description
+  # is a "No interruption" update, so CloudFormation patches the existing
+  # deployment in place and the stale snapshot keeps serving traffic.)
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref FrontApi
+      Description: !Sub "${ApiStageName} deployment for ${AWS::StackName} front API"
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref FrontApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref ApiStageName
+      Description: !Sub "${ApiStageName} stage with outbound mTLS client certificate"
+      # Outbound mTLS: present this client certificate when API Gateway
+      # makes the HTTPS request to the NLB. Omitted entirely (via
+      # AWS::NoValue) when EnableOutboundMtls is "false", for
+      # negative-testing that outbound mTLS is actually enforced -- see
+      # the EnableOutboundMtls parameter description.
+      ClientCertificateId: !If
+        - OutboundMtlsDisabled
+        - !Ref AWS::NoValue
+        - !Ref FrontClientCert
+
+Outputs:
+  NlbDnsName:
+    Description: >
+      DNS name of the Network Load Balancer. FrontApi's HTTP integration
+      (see the "/validate" path in FrontApi.Body) points at
+      "https://<this value>/validate".
+    Value: !GetAtt Nlb.DNSName
+
+  FrontClientCertArn:
+    Description: >
+      ACM ARN of the client certificate for outbound mTLS. Set as
+      ApiStage's ClientCertificateId when EnableOutboundMtls is "true"
+      (the default); omitted from the stage when "false" for
+      negative-testing.
+    Value: !Ref FrontClientCert
+
+  FrontApiUrl:
+    Description: Invoke URL for the front API's /validate route.
+    Value: !Sub "https://${FrontApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/validate"
+
+  FrontApiId:
+    Description: REST API ID of the front-facing API.
+    Value: !Ref FrontApi
+
+  EcsClusterName:
+    Description: ECS cluster name.
+    Value: !Ref EcsCluster
+
+  TargetGroupArn:
+    Description: ARN of the NLB target group the ECS Service registers tasks with.
+    Value: !Ref TargetGroup
+
+  VpcId:
+    Description: VPC created for this stack.
+    Value: !Ref Vpc
+
+  NlbAccessLogsBucketName:
+    Description: >
+      S3 bucket holding NLB access logs. Versioning is enabled, so it
+      must be emptied of all object versions/delete markers before
+      `sam delete` can remove it (see Cleanup in README.md).
+    Value: !Ref NlbAccessLogsBucket
