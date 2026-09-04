@@ -180,7 +180,7 @@ sam deploy \
       EnableOutboundMtls=true
 ```
 
-6. Test the API again:
+6. Wait a minute or two after the stack finishes, then invoke the front API again:
 
 ```bash
 curl -v "$FRONT_API_URL"
